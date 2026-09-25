@@ -225,8 +225,13 @@ function isImagePart(p: ImagePart): boolean {
     if (hasImageFileExtension(p)) return true;
   }
   if (p.type === 'media') {
-    // OpenCode v2 media parts: `{ type: 'media', mediaType, data, filename }`.
-    const mediaType = p.mediaType as string | undefined;
+    // OpenCode v2 media parts, two shapes: the flat schema part
+    // `{ type: 'media', mediaType, data, filename }` and the hook-time
+    // `{ type: 'media', media: Media, filename, metadata }` where the nested
+    // Media instance carries the mime in `media.mediaType`.
+    const mediaType =
+      (p.mediaType as string | undefined) ??
+      (p.media as { mediaType?: string } | undefined)?.mediaType;
     if (mediaType?.startsWith('image/')) return true;
     if (hasImageFileExtension(p)) return true;
   }
@@ -448,13 +453,13 @@ function writeUniqueFile(
   return null;
 }
 
-export function processImageAttachments(args: {
+export async function processImageAttachments(args: {
   messages: MessageWithParts[];
   workDir: string;
   imageRouting: 'auto' | 'direct';
   disabledAgents: ReadonlySet<string>;
   log: (msg: string) => void;
-}): boolean {
+}): Promise<boolean> {
   const { messages, workDir, imageRouting, disabledAgents, log } = args;
 
   // Repair legacy plugin-generated ignore rules before any early return so
@@ -579,8 +584,50 @@ export function processImageAttachments(args: {
     const savedPaths: string[] = [];
     const savedImageParts = new Set<ImagePart>();
     for (const p of imageParts) {
-      const url = p.url as string | undefined;
-      const mediaType = p.mediaType as string | undefined;
+      // OpenCode v2 hook-time media parts wrap a lazy AI SDK Media instance in
+      // `media` (mime on `media.mediaType`): the part itself carries no
+      // url/data. Resolve its data URL here so the shared decode path below
+      // sees one `url` field. v1 and flat v2 parts already carry `url`.
+      let url = p.url as string | undefined;
+      const mediaObj = (p as { media?: Record<string, unknown> }).media;
+      const nestedMediaType =
+        typeof mediaObj?.mediaType === 'string'
+          ? mediaObj.mediaType
+          : undefined;
+      if (!url && mediaObj) {
+        try {
+          // Accessors may be methods (called) or prototype getters (plain
+          // property access); @opencode/ai returns Effect values, which must
+          // be run — awaiting an Effect is a no-op. `effect` stays a dynamic
+          // import inside the try: it is an undeclared dep owned by the host,
+          // and an unresolvable import must degrade to leaving the image in
+          // place, never abort the whole messages.transform hook.
+          const { Effect } = await import('effect');
+          const read = async (key: string): Promise<unknown> => {
+            const slot = mediaObj[key];
+            const value =
+              typeof slot === 'function' ? slot.call(mediaObj) : slot;
+            return Effect.isEffect(value)
+              ? Effect.runPromise(
+                  value as Parameters<typeof Effect.runPromise>[0],
+                )
+              : value;
+          };
+          await read('materialize'); // lazy: loads bytes before dataUrl()
+          const resolved = await read('dataUrl');
+          if (typeof resolved === 'string' && resolved.startsWith('data:')) {
+            url = resolved;
+          } else if (nestedMediaType) {
+            const b64 = await read('base64');
+            if (typeof b64 === 'string' && b64.length > 0) {
+              url = `data:${nestedMediaType};base64,${b64}`;
+            }
+          }
+        } catch (error) {
+          log(`[image-hook] media resolution failed: ${String(error)}`);
+        }
+      }
+      const mediaType = (p.mediaType as string | undefined) ?? nestedMediaType;
       const data = p.data as string | undefined;
       const filename =
         (p.filename as string | undefined) ?? (p.name as string | undefined);
